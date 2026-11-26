@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 jobs:
   ipa:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - run: brew install xcodegen
