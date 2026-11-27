@@ -1,5 +1,6 @@
 import SwiftUI
 import VisionKit
+import ImageIO
 
 @main
 struct JisuiApp: App {
@@ -194,6 +195,147 @@ struct Scanner: UIViewControllerRepresentable {
     }
 }
 
+func thumb(_ url: URL, max: Int) -> UIImage? {
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+    let opts: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: max
+    ]
+    guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+    return UIImage(cgImage: cg)
+}
+
+struct Idx: Identifiable { let id: Int }
+
+struct Thumb: View {
+    let url: URL
+    @State var img: UIImage?
+    var body: some View {
+        ZStack {
+            Color.gray.opacity(0.15)
+            if let i = img { Image(uiImage: i).resizable().scaledToFit() }
+        }
+        .aspectRatio(0.72, contentMode: .fit)
+        .task { img = await Task.detached { thumb(url, max: 300) }.value }
+    }
+}
+
+final class ZScroll: UIScrollView {
+    let iv = UIImageView()
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if zoomScale == 1 { iv.frame = bounds }
+    }
+}
+
+struct ZoomPage: UIViewRepresentable {
+    let url: URL
+    func makeCoordinator() -> Coord { Coord() }
+    func makeUIView(context: Context) -> ZScroll {
+        let sv = ZScroll()
+        sv.minimumZoomScale = 1
+        sv.maximumZoomScale = 5
+        sv.delegate = context.coordinator
+        sv.showsVerticalScrollIndicator = false
+        sv.showsHorizontalScrollIndicator = false
+        sv.iv.contentMode = .scaleAspectFit
+        sv.addSubview(sv.iv)
+        context.coordinator.iv = sv.iv
+        let iv = sv.iv
+        DispatchQueue.global(qos: .userInitiated).async {
+            let im = UIImage(contentsOfFile: url.path)
+            DispatchQueue.main.async { iv.image = im }
+        }
+        return sv
+    }
+    func updateUIView(_ v: ZScroll, context: Context) {}
+    final class Coord: NSObject, UIScrollViewDelegate {
+        var iv: UIImageView?
+        func viewForZooming(in scrollView: UIScrollView) -> UIView? { iv }
+    }
+}
+
+struct Pager: View {
+    @Binding var files: [URL]
+    @State var idx: Int
+    let s: Store
+    @Environment(\.dismiss) var dismiss
+    @State var confirm = false
+
+    init(files: Binding<[URL]>, start: Int, s: Store) {
+        _files = files
+        _idx = State(initialValue: start)
+        self.s = s
+    }
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            Color.black.ignoresSafeArea()
+            TabView(selection: $idx) {
+                ForEach(Array(files.enumerated()), id: \.element) { i, f in
+                    ZoomPage(url: f).tag(i).ignoresSafeArea()
+                }
+            }
+            .tabViewStyle(.page(indexDisplayMode: .never))
+            .ignoresSafeArea()
+            HStack {
+                Button("閉じる") { dismiss() }
+                Spacer()
+                Text("\(idx + 1) / \(files.count)")
+                Spacer()
+                Button(role: .destructive) { confirm = true } label: { Image(systemName: "trash") }
+            }
+            .padding()
+            .background(Color.black.opacity(0.5))
+            .foregroundColor(.white)
+        }
+        .confirmationDialog("このページを削除しますか", isPresented: $confirm) {
+            Button("削除", role: .destructive) { remove() }
+        }
+    }
+
+    func remove() {
+        guard idx < files.count else { return }
+        try? FileManager.default.removeItem(at: files[idx])
+        files.remove(at: idx)
+        s.count = pageFiles().count
+        s.lastAdded = 0
+        s.pdf = nil
+        idx = min(idx, max(0, files.count - 1))
+        if files.isEmpty { dismiss() }
+    }
+}
+
+struct PreviewView: View {
+    let s: Store
+    @Environment(\.dismiss) var dismiss
+    @State var files = pageFiles()
+    @State var open: Idx?
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 90), spacing: 6)], spacing: 6) {
+                    ForEach(Array(files.enumerated()), id: \.element) { i, f in
+                        Thumb(url: f)
+                            .overlay(alignment: .bottomTrailing) {
+                                Text("\(i + 1)").font(.caption2).padding(3)
+                                    .background(Color.black.opacity(0.6)).foregroundColor(.white)
+                            }
+                            .onTapGesture { open = Idx(id: i) }
+                    }
+                }
+                .padding(6)
+            }
+            .navigationTitle("\(files.count) ページ")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("閉じる") { dismiss() } } }
+        }
+        .fullScreenCover(item: $open) { o in Pager(files: $files, start: o.id, s: s) }
+    }
+}
+
 struct ContentView: View {
     @StateObject var s = Store()
     @AppStorage("spread") var spread = true
@@ -203,6 +345,7 @@ struct ContentView: View {
     @AppStorage("cut") var cut = 50.0
     @State var showScanner = false
     @State var confirmClear = false
+    @State var showPreview = false
     @State var name = ""
 
     var body: some View {
@@ -228,6 +371,7 @@ struct ContentView: View {
                 Button("直前を削除") { s.undo() }.disabled(s.busy || s.lastAdded == 0)
                 Button("全消去", role: .destructive) { confirmClear = true }.disabled(s.busy)
                 TextField("ファイル名(例: 全集第3巻)", text: $name)
+                Button("プレビュー") { showPreview = true }.disabled(s.busy || s.count == 0)
                 Button("PDF書き出し") { s.export(name: name) }.disabled(s.busy || s.count == 0)
                 if let u = s.pdf { ShareLink(item: u) }
             }
@@ -238,6 +382,7 @@ struct ContentView: View {
                 if let scan = scan { s.ingest(scan, spread: spread, rtl: rtl, cut: cut, long: long, q: q) }
             }.ignoresSafeArea()
         }
+        .sheet(isPresented: $showPreview) { PreviewView(s: s) }
         .confirmationDialog("全ページを消去しますか", isPresented: $confirmClear) {
             Button("消去", role: .destructive) { s.clear() }
         }
