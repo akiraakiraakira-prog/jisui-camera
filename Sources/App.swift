@@ -108,6 +108,7 @@ final class Store: ObservableObject {
     @Published var status = ""
     @Published var busy = false
     @Published var pdf: URL?
+    @Published var ver = 0
     var lastAdded = 0
     var recent: [Double] = []
 
@@ -156,6 +157,7 @@ final class Store: ObservableObject {
     }
 
     func clear() {
+        try? FileManager.default.removeItem(at: origURL)
         for u in pageFiles() { try? FileManager.default.removeItem(at: u) }
         lastAdded = 0; recent = []; count = 0; status = "全消去しました"; pdf = nil
     }
@@ -204,6 +206,136 @@ func thumb(_ url: URL, max: Int) -> UIImage? {
     ]
     guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
     return UIImage(cgImage: cg)
+}
+
+let origURL = pagesURL.appendingPathComponent("orig")
+
+struct CropEditor: View {
+    let url: URL
+    let s: Store
+    @Environment(\.dismiss) var dismiss
+    @State var img: UIImage?
+    @State var r = CGRect(x: 0, y: 0, width: 1, height: 1)
+    @State var mask = -1
+    @State var start = CGRect.zero
+    @State var hasBackup = false
+
+    var backup: URL { origURL.appendingPathComponent(url.lastPathComponent) }
+
+    // ビットマスク: 1=左辺 2=右辺 4=上辺 8=下辺。角は2辺の組み合わせ、15=枠全体の移動
+    func pick(_ p: CGPoint, _ cr: CGRect) -> Int {
+        let t: CGFloat = 36
+        let inX = p.x > cr.minX - t && p.x < cr.maxX + t
+        let inY = p.y > cr.minY - t && p.y < cr.maxY + t
+        let dL = abs(p.x - cr.minX), dR = abs(p.x - cr.maxX)
+        let dT = abs(p.y - cr.minY), dB = abs(p.y - cr.maxY)
+        var m = 0
+        if inY && dL < t && dL <= dR { m |= 1 } else if inY && dR < t { m |= 2 }
+        if inX && dT < t && dT <= dB { m |= 4 } else if inX && dB < t { m |= 8 }
+        if m == 0 && cr.contains(p) { m = 15 }
+        return m
+    }
+
+    func drag(_ v: DragGesture.Value, _ cr: CGRect, _ dw: CGFloat, _ dh: CGFloat) {
+        if mask < 0 { start = r; mask = pick(v.startLocation, cr) }
+        let dx = v.translation.width / dw
+        let dy = v.translation.height / dh
+        var x0 = start.minX, x1 = start.maxX, y0 = start.minY, y1 = start.maxY
+        let m: CGFloat = 0.05
+        if mask == 15 {
+            let w = start.width, h = start.height
+            x0 = min(max(0, start.minX + dx), 1 - w)
+            y0 = min(max(0, start.minY + dy), 1 - h)
+            x1 = x0 + w; y1 = y0 + h
+        } else {
+            if mask & 1 != 0 { x0 = min(max(0, start.minX + dx), x1 - m) }
+            if mask & 2 != 0 { x1 = max(min(1, start.maxX + dx), x0 + m) }
+            if mask & 4 != 0 { y0 = min(max(0, start.minY + dy), y1 - m) }
+            if mask & 8 != 0 { y1 = max(min(1, start.maxY + dy), y0 + m) }
+        }
+        r = CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
+    }
+
+    func handlePoint(_ i: Int, _ c: CGRect) -> CGPoint {
+        let pts = [CGPoint(x: c.minX, y: c.minY), CGPoint(x: c.midX, y: c.minY), CGPoint(x: c.maxX, y: c.minY),
+                   CGPoint(x: c.minX, y: c.midY), CGPoint(x: c.maxX, y: c.midY),
+                   CGPoint(x: c.minX, y: c.maxY), CGPoint(x: c.midX, y: c.maxY), CGPoint(x: c.maxX, y: c.maxY)]
+        return pts[i]
+    }
+
+    func apply() {
+        guard let im = img, let cg = im.cgImage else { dismiss(); return }
+        let W = CGFloat(cg.width), H = CGFloat(cg.height)
+        let rect = CGRect(x: (r.minX * W).rounded(), y: (r.minY * H).rounded(),
+                          width: (r.width * W).rounded(), height: (r.height * H).rounded())
+        let q0 = UserDefaults.standard.integer(forKey: "q")
+        guard let c = cg.cropping(to: rect),
+              let d = UIImage(cgImage: c).jpegData(compressionQuality: CGFloat(q0 == 0 ? 70 : q0) / 100) else { dismiss(); return }
+        let fm = FileManager.default
+        try? fm.createDirectory(at: origURL, withIntermediateDirectories: true)
+        if !fm.fileExists(atPath: backup.path) { try? fm.copyItem(at: url, to: backup) }
+        try? d.write(to: url)
+        s.ver += 1; s.pdf = nil
+        dismiss()
+    }
+
+    func restore() {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: backup.path) {
+            try? fm.removeItem(at: url)
+            try? fm.copyItem(at: backup, to: url)
+            try? fm.removeItem(at: backup)
+        }
+        s.ver += 1; s.pdf = nil
+        dismiss()
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Button("キャンセル") { dismiss() }
+                Spacer()
+                if hasBackup { Button("元に戻す") { restore() } }
+                Spacer()
+                Button("適用") { apply() }.bold()
+            }
+            .padding()
+            .foregroundColor(.white)
+            GeometryReader { g in
+                if let im = img {
+                    let sc = min(g.size.width / im.size.width, g.size.height / im.size.height)
+                    let dw = im.size.width * sc
+                    let dh = im.size.height * sc
+                    let ox = (g.size.width - dw) / 2
+                    let oy = (g.size.height - dh) / 2
+                    let cr = CGRect(x: ox + r.minX * dw, y: oy + r.minY * dh, width: r.width * dw, height: r.height * dh)
+                    ZStack {
+                        Image(uiImage: im).resizable().frame(width: dw, height: dh).position(x: ox + dw / 2, y: oy + dh / 2)
+                        Path { p in
+                            p.addRect(CGRect(x: ox, y: oy, width: dw, height: dh))
+                            p.addRect(cr)
+                        }
+                        .fill(Color.black.opacity(0.55), style: FillStyle(eoFill: true))
+                        Rectangle().stroke(Color.yellow, lineWidth: 2)
+                            .frame(width: cr.width, height: cr.height).position(x: cr.midX, y: cr.midY)
+                        ForEach(0..<8, id: \.self) { i in
+                            Circle().fill(Color.yellow).frame(width: 16, height: 16).position(handlePoint(i, cr))
+                        }
+                    }
+                    .frame(width: g.size.width, height: g.size.height)
+                    .contentShape(Rectangle())
+                    .gesture(DragGesture(minimumDistance: 0)
+                        .onChanged { v in drag(v, cr, dw, dh) }
+                        .onEnded { _ in mask = -1 })
+                }
+            }
+        }
+        .background(Color.black.ignoresSafeArea())
+        .onAppear {
+            img = UIImage(contentsOfFile: url.path)
+            hasBackup = FileManager.default.fileExists(atPath: backup.path)
+        }
+    }
 }
 
 struct Idx: Identifiable { let id: Int }
@@ -259,9 +391,10 @@ struct ZoomPage: UIViewRepresentable {
 struct Pager: View {
     @Binding var files: [URL]
     @State var idx: Int
-    let s: Store
+    @ObservedObject var s: Store
     @Environment(\.dismiss) var dismiss
     @State var confirm = false
+    @State var editing = false
 
     init(files: Binding<[URL]>, start: Int, s: Store) {
         _files = files
@@ -274,7 +407,7 @@ struct Pager: View {
             Color.black.ignoresSafeArea()
             TabView(selection: $idx) {
                 ForEach(Array(files.enumerated()), id: \.element) { i, f in
-                    ZoomPage(url: f).tag(i).ignoresSafeArea()
+                    ZoomPage(url: f).id("\(f.lastPathComponent)-\(s.ver)").tag(i).ignoresSafeArea()
                 }
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
@@ -284,11 +417,16 @@ struct Pager: View {
                 Spacer()
                 Text("\(idx + 1) / \(files.count)")
                 Spacer()
+                Button { editing = true } label: { Image(systemName: "crop") }
+                    .padding(.trailing, 16)
                 Button(role: .destructive) { confirm = true } label: { Image(systemName: "trash") }
             }
             .padding()
             .background(Color.black.opacity(0.5))
             .foregroundColor(.white)
+        }
+        .fullScreenCover(isPresented: $editing) {
+            if idx < files.count { CropEditor(url: files[idx], s: s) }
         }
         .confirmationDialog("このページを削除しますか", isPresented: $confirm) {
             Button("削除", role: .destructive) { remove() }
@@ -297,6 +435,7 @@ struct Pager: View {
 
     func remove() {
         guard idx < files.count else { return }
+        try? FileManager.default.removeItem(at: origURL.appendingPathComponent(files[idx].lastPathComponent))
         try? FileManager.default.removeItem(at: files[idx])
         files.remove(at: idx)
         s.count = pageFiles().count
@@ -308,7 +447,7 @@ struct Pager: View {
 }
 
 struct PreviewView: View {
-    let s: Store
+    @ObservedObject var s: Store
     @Environment(\.dismiss) var dismiss
     @State var files = pageFiles()
     @State var open: Idx?
@@ -319,6 +458,7 @@ struct PreviewView: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 90), spacing: 6)], spacing: 6) {
                     ForEach(Array(files.enumerated()), id: \.element) { i, f in
                         Thumb(url: f)
+                            .id("\(f.lastPathComponent)-\(s.ver)")
                             .overlay(alignment: .bottomTrailing) {
                                 Text("\(i + 1)").font(.caption2).padding(3)
                                     .background(Color.black.opacity(0.6)).foregroundColor(.white)
