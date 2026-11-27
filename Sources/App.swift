@@ -1,6 +1,7 @@
 import SwiftUI
 import VisionKit
 import ImageIO
+import CoreImage
 
 @main
 struct JisuiApp: App {
@@ -215,62 +216,101 @@ struct CropEditor: View {
     let s: Store
     @Environment(\.dismiss) var dismiss
     @State var img: UIImage?
-    @State var r = CGRect(x: 0, y: 0, width: 1, height: 1)
-    @State var mask = -1
-    @State var start = CGRect.zero
+    @State var q: [CGPoint] = [CGPoint(x: 0, y: 0), CGPoint(x: 1, y: 0), CGPoint(x: 1, y: 1), CGPoint(x: 0, y: 1)]
+    @State var startQ: [CGPoint] = []
+    @State var grab = -1
     @State var hasBackup = false
 
     var backup: URL { origURL.appendingPathComponent(url.lastPathComponent) }
 
-    // ビットマスク: 1=左辺 2=右辺 4=上辺 8=下辺。角は2辺の組み合わせ、15=枠全体の移動
-    func pick(_ p: CGPoint, _ cr: CGRect) -> Int {
-        let t: CGFloat = 36
-        let inX = p.x > cr.minX - t && p.x < cr.maxX + t
-        let inY = p.y > cr.minY - t && p.y < cr.maxY + t
-        let dL = abs(p.x - cr.minX), dR = abs(p.x - cr.maxX)
-        let dT = abs(p.y - cr.minY), dB = abs(p.y - cr.maxY)
-        var m = 0
-        if inY && dL < t && dL <= dR { m |= 1 } else if inY && dR < t { m |= 2 }
-        if inX && dT < t && dT <= dB { m |= 4 } else if inX && dB < t { m |= 8 }
-        if m == 0 && cr.contains(p) { m = 15 }
-        return m
+    func segDist(_ p: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
+        let abx = b.x - a.x, aby = b.y - a.y
+        let l2 = abx * abx + aby * aby
+        var t: CGFloat = l2 == 0 ? 0 : ((p.x - a.x) * abx + (p.y - a.y) * aby) / l2
+        t = min(1, max(0, t))
+        return hypot(p.x - (a.x + t * abx), p.y - (a.y + t * aby))
     }
 
-    func drag(_ v: DragGesture.Value, _ cr: CGRect, _ dw: CGFloat, _ dh: CGFloat) {
-        if mask < 0 { start = r; mask = pick(v.startLocation, cr) }
-        let dx = v.translation.width / dw
-        let dy = v.translation.height / dh
-        var x0 = start.minX, x1 = start.maxX, y0 = start.minY, y1 = start.maxY
-        let m: CGFloat = 0.05
-        if mask == 15 {
-            let w = start.width, h = start.height
-            x0 = min(max(0, start.minX + dx), 1 - w)
-            y0 = min(max(0, start.minY + dy), 1 - h)
-            x1 = x0 + w; y1 = y0 + h
-        } else {
-            if mask & 1 != 0 { x0 = min(max(0, start.minX + dx), x1 - m) }
-            if mask & 2 != 0 { x1 = max(min(1, start.maxX + dx), x0 + m) }
-            if mask & 4 != 0 { y0 = min(max(0, start.minY + dy), y1 - m) }
-            if mask & 8 != 0 { y1 = max(min(1, start.maxY + dy), y0 + m) }
+    func poly(_ v: [CGPoint]) -> Path {
+        var path = Path()
+        path.move(to: v[0])
+        for i in 1..<4 { path.addLine(to: v[i]) }
+        path.closeSubpath()
+        return path
+    }
+
+    // 0-3: 角(左上・右上・右下・左下) / 4-7: 辺(上・右・下・左) / 8: 全体の移動 / -2: 何も掴まない
+    func pick(_ p: CGPoint, _ v: [CGPoint]) -> Int {
+        var best = -2
+        var bd: CGFloat = 44
+        for i in 0..<4 {
+            let d = hypot(p.x - v[i].x, p.y - v[i].y)
+            if d < bd { bd = d; best = i }
         }
-        r = CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
+        if best >= 0 { return best }
+        bd = 30
+        for i in 0..<4 {
+            let d = segDist(p, v[i], v[(i + 1) % 4])
+            if d < bd { bd = d; best = 4 + i }
+        }
+        if best >= 0 { return best }
+        return poly(v).contains(p) ? 8 : -2
     }
 
-    func handlePoint(_ i: Int, _ c: CGRect) -> CGPoint {
-        let pts = [CGPoint(x: c.minX, y: c.minY), CGPoint(x: c.midX, y: c.minY), CGPoint(x: c.maxX, y: c.minY),
-                   CGPoint(x: c.minX, y: c.midY), CGPoint(x: c.maxX, y: c.midY),
-                   CGPoint(x: c.minX, y: c.maxY), CGPoint(x: c.midX, y: c.maxY), CGPoint(x: c.maxX, y: c.maxY)]
-        return pts[i]
+    func drag(_ val: DragGesture.Value, _ v: [CGPoint], _ dw: CGFloat, _ dh: CGFloat) {
+        if grab == -1 { startQ = q; grab = pick(val.startLocation, v) }
+        if grab < 0 || startQ.count != 4 { return }
+        let dx = val.translation.width / dw
+        let dy = val.translation.height / dh
+        func cl(_ x: CGFloat) -> CGFloat { min(1, max(0, x)) }
+        var n = startQ
+        switch grab {
+        case 0...3:
+            n[grab] = CGPoint(x: cl(startQ[grab].x + dx), y: cl(startQ[grab].y + dy))
+        case 4:
+            for i in [0, 1] { n[i].y = cl(startQ[i].y + dy) }
+        case 5:
+            for i in [1, 2] { n[i].x = cl(startQ[i].x + dx) }
+        case 6:
+            for i in [2, 3] { n[i].y = cl(startQ[i].y + dy) }
+        case 7:
+            for i in [3, 0] { n[i].x = cl(startQ[i].x + dx) }
+        default:
+            let xs = startQ.map { $0.x }, ys = startQ.map { $0.y }
+            let ddx = min(max(dx, -(xs.min() ?? 0)), 1 - (xs.max() ?? 1))
+            let ddy = min(max(dy, -(ys.min() ?? 0)), 1 - (ys.max() ?? 1))
+            n = startQ.map { CGPoint(x: $0.x + ddx, y: $0.y + ddy) }
+        }
+        q = n
     }
 
     func apply() {
         guard let im = img, let cg = im.cgImage else { dismiss(); return }
         let W = CGFloat(cg.width), H = CGFloat(cg.height)
-        let rect = CGRect(x: (r.minX * W).rounded(), y: (r.minY * H).rounded(),
-                          width: (r.width * W).rounded(), height: (r.height * H).rounded())
+        let pts = q.map { CGPoint(x: $0.x * W, y: $0.y * H) }
+        let axis = abs(pts[0].x - pts[3].x) < 0.5 && abs(pts[1].x - pts[2].x) < 0.5
+            && abs(pts[0].y - pts[1].y) < 0.5 && abs(pts[3].y - pts[2].y) < 0.5
+        var out: CGImage?
+        if axis {
+            let rect = CGRect(x: pts[0].x.rounded(), y: pts[0].y.rounded(),
+                              width: (pts[1].x - pts[0].x).rounded(), height: (pts[3].y - pts[0].y).rounded())
+            if rect.width < 20 || rect.height < 20 { return }
+            out = cg.cropping(to: rect)
+        } else if let f = CIFilter(name: "CIPerspectiveCorrection") {
+            func cv(_ p: CGPoint) -> CIVector { CIVector(x: p.x, y: H - p.y) }
+            f.setValue(CIImage(cgImage: cg), forKey: kCIInputImageKey)
+            f.setValue(cv(pts[0]), forKey: "inputTopLeft")
+            f.setValue(cv(pts[1]), forKey: "inputTopRight")
+            f.setValue(cv(pts[2]), forKey: "inputBottomRight")
+            f.setValue(cv(pts[3]), forKey: "inputBottomLeft")
+            if let o = f.outputImage, o.extent.width >= 20, o.extent.height >= 20,
+               let c = CIContext().createCGImage(o, from: o.extent) {
+                out = grayScaled(c, long: 100000)?.0
+            }
+        }
         let q0 = UserDefaults.standard.integer(forKey: "q")
-        guard let c = cg.cropping(to: rect),
-              let d = UIImage(cgImage: c).jpegData(compressionQuality: CGFloat(q0 == 0 ? 70 : q0) / 100) else { dismiss(); return }
+        guard let c = out,
+              let d = UIImage(cgImage: c).jpegData(compressionQuality: CGFloat(q0 == 0 ? 70 : q0) / 100) else { return }
         let fm = FileManager.default
         try? fm.createDirectory(at: origURL, withIntermediateDirectories: true)
         if !fm.fileExists(atPath: backup.path) { try? fm.copyItem(at: url, to: backup) }
@@ -308,25 +348,28 @@ struct CropEditor: View {
                     let dh = im.size.height * sc
                     let ox = (g.size.width - dw) / 2
                     let oy = (g.size.height - dh) / 2
-                    let cr = CGRect(x: ox + r.minX * dw, y: oy + r.minY * dh, width: r.width * dw, height: r.height * dh)
+                    let v = q.map { CGPoint(x: ox + $0.x * dw, y: oy + $0.y * dh) }
                     ZStack {
                         Image(uiImage: im).resizable().frame(width: dw, height: dh).position(x: ox + dw / 2, y: oy + dh / 2)
                         Path { p in
                             p.addRect(CGRect(x: ox, y: oy, width: dw, height: dh))
-                            p.addRect(cr)
+                            p.addPath(poly(v))
                         }
                         .fill(Color.black.opacity(0.55), style: FillStyle(eoFill: true))
-                        Rectangle().stroke(Color.yellow, lineWidth: 2)
-                            .frame(width: cr.width, height: cr.height).position(x: cr.midX, y: cr.midY)
-                        ForEach(0..<8, id: \.self) { i in
-                            Circle().fill(Color.yellow).frame(width: 16, height: 16).position(handlePoint(i, cr))
+                        poly(v).stroke(Color.yellow, lineWidth: 2)
+                        ForEach(0..<4, id: \.self) { i in
+                            RoundedRectangle(cornerRadius: 3).fill(Color.yellow).frame(width: 14, height: 14)
+                                .position(x: (v[i].x + v[(i + 1) % 4].x) / 2, y: (v[i].y + v[(i + 1) % 4].y) / 2)
+                        }
+                        ForEach(0..<4, id: \.self) { i in
+                            Circle().fill(Color.yellow).frame(width: 20, height: 20).position(v[i])
                         }
                     }
                     .frame(width: g.size.width, height: g.size.height)
                     .contentShape(Rectangle())
                     .gesture(DragGesture(minimumDistance: 0)
-                        .onChanged { v in drag(v, cr, dw, dh) }
-                        .onEnded { _ in mask = -1 })
+                        .onChanged { val in drag(val, v, dw, dh) }
+                        .onEnded { _ in grab = -1 })
                 }
             }
         }
