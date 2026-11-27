@@ -152,6 +152,23 @@ final class Store: ObservableObject {
         }
     }
 
+    // 並び順どおりに 000001.jpg から振り直す(切り抜き前の元画像も同じ名前に合わせる)
+    func renumber(_ order: [URL]) {
+        let fm = FileManager.default
+        for (i, u) in order.enumerated() {
+            let b = origURL.appendingPathComponent(u.lastPathComponent)
+            try? fm.moveItem(at: u, to: pagesURL.appendingPathComponent("t\(i).tmp"))
+            if fm.fileExists(atPath: b.path) { try? fm.moveItem(at: b, to: origURL.appendingPathComponent("t\(i).tmp")) }
+        }
+        for i in 0..<order.count {
+            let name = String(format: "%06d.jpg", i + 1)
+            try? fm.moveItem(at: pagesURL.appendingPathComponent("t\(i).tmp"), to: pagesURL.appendingPathComponent(name))
+            let tb = origURL.appendingPathComponent("t\(i).tmp")
+            if fm.fileExists(atPath: tb.path) { try? fm.moveItem(at: tb, to: origURL.appendingPathComponent(name)) }
+        }
+        lastAdded = 0; pdf = nil; ver += 1
+    }
+
     func undo() {
         for u in pageFiles().suffix(lastAdded) { try? FileManager.default.removeItem(at: u) }
         lastAdded = 0; count = pageFiles().count; status = "直前の撮影を削除しました"; pdf = nil
@@ -494,26 +511,119 @@ struct PreviewView: View {
     @Environment(\.dismiss) var dismiss
     @State var files = pageFiles()
     @State var open: Idx?
+    @State var selecting = false
+    @State var sel = Set<URL>()
+    @State var moving = false
+    @State var rangeMode = false
+    @State var lastTap: Int?
+    @State var confirmDel = false
+
+    func tap(_ i: Int, _ f: URL) {
+        if moving { moveSel(before: f); return }
+        if selecting {
+            if rangeMode, let l = lastTap {
+                for k in min(l, i)...max(l, i) where k < files.count { sel.insert(files[k]) }
+            } else if sel.contains(f) {
+                sel.remove(f)
+            } else {
+                sel.insert(f)
+            }
+            lastTap = i
+        } else {
+            open = Idx(id: i)
+        }
+    }
+
+    // 選択したページを、target の直前へ(nil なら末尾へ)移動する
+    func moveSel(before target: URL?) {
+        if sel.isEmpty { moving = false; return }
+        if let t = target, sel.contains(t) { return }
+        let picked = files.filter { sel.contains($0) }
+        var rest = files.filter { !sel.contains($0) }
+        if let t = target, let k = rest.firstIndex(of: t) {
+            rest.insert(contentsOf: picked, at: k)
+        } else {
+            rest.append(contentsOf: picked)
+        }
+        s.renumber(rest)
+        files = pageFiles()
+        sel = []; lastTap = nil; moving = false
+    }
+
+    func deleteSel() {
+        let fm = FileManager.default
+        for u in sel {
+            try? fm.removeItem(at: origURL.appendingPathComponent(u.lastPathComponent))
+            try? fm.removeItem(at: u)
+        }
+        files = pageFiles()
+        s.count = files.count; s.lastAdded = 0; s.pdf = nil
+        sel = []; lastTap = nil
+    }
+
+    func cell(_ i: Int, _ f: URL) -> some View {
+        let on = sel.contains(f)
+        return Thumb(url: f)
+            .id("\(f.lastPathComponent)-\(s.ver)")
+            .overlay(alignment: .bottomTrailing) {
+                Text("\(i + 1)").font(.caption2).padding(3)
+                    .background(Color.black.opacity(0.6)).foregroundColor(.white)
+            }
+            .overlay(alignment: .topLeading) {
+                if selecting {
+                    Image(systemName: on ? "checkmark.circle.fill" : "circle")
+                        .foregroundColor(on ? .blue : .white).padding(4).shadow(radius: 2)
+                }
+            }
+            .overlay(Rectangle().stroke(Color.blue, lineWidth: on ? 3 : 0))
+            .onTapGesture { tap(i, f) }
+    }
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 90), spacing: 6)], spacing: 6) {
-                    ForEach(Array(files.enumerated()), id: \.element) { i, f in
-                        Thumb(url: f)
-                            .id("\(f.lastPathComponent)-\(s.ver)")
-                            .overlay(alignment: .bottomTrailing) {
-                                Text("\(i + 1)").font(.caption2).padding(3)
-                                    .background(Color.black.opacity(0.6)).foregroundColor(.white)
-                            }
-                            .onTapGesture { open = Idx(id: i) }
+            VStack(spacing: 0) {
+                if moving {
+                    HStack {
+                        Text("移動先のページをタップ(その直前に入ります)").font(.footnote)
+                        Spacer()
+                        Button("末尾へ") { moveSel(before: nil) }
+                        Button("取消") { moving = false }
+                    }
+                    .padding(8)
+                    .background(Color.yellow.opacity(0.3))
+                }
+                ScrollView {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 90), spacing: 6)], spacing: 6) {
+                        ForEach(Array(files.enumerated()), id: \.element) { i, f in
+                            cell(i, f)
+                        }
+                    }
+                    .padding(6)
+                }
+            }
+            .navigationTitle(selecting ? "\(sel.count) / \(files.count) 選択" : "\(files.count) ページ")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(selecting ? "完了" : "選択") {
+                        selecting.toggle()
+                        if !selecting { sel = []; moving = false; rangeMode = false; lastTap = nil }
                     }
                 }
-                .padding(6)
+                ToolbarItem(placement: .confirmationAction) { Button("閉じる") { dismiss() } }
+                ToolbarItemGroup(placement: .bottomBar) {
+                    if selecting {
+                        Button("全選択") { sel = Set(files) }
+                        Button(rangeMode ? "範囲:オン" : "範囲") { rangeMode.toggle() }
+                        Spacer()
+                        Button("移動") { moving = true }.disabled(sel.isEmpty)
+                        Button("削除(\(sel.count))", role: .destructive) { confirmDel = true }.disabled(sel.isEmpty)
+                    }
+                }
             }
-            .navigationTitle("\(files.count) ページ")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("閉じる") { dismiss() } } }
+            .confirmationDialog("選択した\(sel.count)ページを削除しますか", isPresented: $confirmDel) {
+                Button("削除", role: .destructive) { deleteSel() }
+            }
         }
         .fullScreenCover(item: $open) { o in Pager(files: $files, start: o.id, s: s) }
     }
